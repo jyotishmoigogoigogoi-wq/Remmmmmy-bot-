@@ -1,141 +1,124 @@
 import os
 import asyncio
+from flask import Flask
+from threading import Thread
 from pyrogram import Client, filters
+from pyrogram.types import Message
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
-from collections import deque
+from pytgcalls.types import AudioPiped
 import yt_dlp
 
-# ================= CONFIG =================
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION_STRING")
+# ========== CONFIG ==========
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+SESSION_STRING = os.environ.get("SESSION_STRING")
 
-AUTHORIZED_USERS = list(map(int, os.getenv("SUDO_USERS", "").split()))
+# ========== FLASK (Keep Alive) ==========
+app = Flask(__name__)
 
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+@app.route('/')
+def home():
+    return "🎵 Music Bot is Running!"
 
-# ================= INIT =================
-app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
-call = PyTgCalls(app)
+@app.route('/health')
+def health():
+    return {"status": "alive"}, 200
 
-queues = {}
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
-# ================= UTIL =================
-def is_allowed(user_id):
-    return user_id in AUTHORIZED_USERS
+# ========== BOT SETUP ==========
+bot = Client(
+    "music_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+    in_memory=True
+)
 
-def get_queue(chat_id):
-    if chat_id not in queues:
-        queues[chat_id] = deque()
-    return queues[chat_id]
+call = PyTgCalls(bot)
 
-def download_audio(query):
+# ========== HELPERS ==========
+def get_audio(query):
     ydl_opts = {
-        "format": "bestaudio",
-        "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
-        "quiet": True,
-        "noplaylist": True,
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
     }
+    
+    if not query.startswith(('http://', 'https://', 'youtu')):
+        query = f"ytsearch1:{query}"
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch:{query}", download=True)
-        entry = info["entries"][0]
-        return ydl.prepare_filename(entry), entry["title"]
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            info = info['entries'][0]
+        
+        formats = [f for f in info.get('formats', []) if f.get('acodec') != 'none']
+        if formats:
+            best = max(formats, key=lambda x: x.get('abr', 0) or 0)
+            return {'url': best['url'], 'title': info.get('title', 'Unknown')}
+        return None
 
-# ================= PLAYER =================
-async def play_next(chat_id):
-    queue = get_queue(chat_id)
+# ========== COMMANDS ==========
+@bot.on_message(filters.command("start"))
+async def start(client, message):
+    await message.reply("""
+🎵 **Music UserBot**
 
-    if not queue:
-        await call.leave_group_call(chat_id)
-        return
+`!join` - Join voice chat
+`!play <song>` - Play music  
+`!leave` - Leave voice chat
+    """)
 
-    file, title = queue.popleft()
+@bot.on_message(filters.command("join"))
+async def join(client, message):
+    try:
+        await call.join_group_call(
+            message.chat.id,
+            AudioPiped("https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3")
+        )
+        await message.reply("✅ Joined voice chat!")
+    except Exception as e:
+        await message.reply(f"❌ {e}")
 
-    await call.change_stream(
-        chat_id,
-        AudioPiped(file)
-    )
-
-# ================= COMMANDS =================
-@app.on_message(filters.command("play"))
-async def play(_, msg):
-    if not is_allowed(msg.from_user.id):
-        return await msg.reply("Not allowed")
-
-    if len(msg.command) < 2:
-        return await msg.reply("Give song name")
-
-    query = msg.text.split(None, 1)[1]
-    status = await msg.reply("Downloading...")
-
-    file, title = await asyncio.to_thread(download_audio, query)
-
-    queue = get_queue(msg.chat.id)
-    queue.append((file, title))
-
-    if len(queue) == 1:
+@bot.on_message(filters.command("play"))
+async def play(client, message):
+    if len(message.command) < 2:
+        return await message.reply("Usage: `!play <song>`")
+    
+    query = " ".join(message.command[1:])
+    status = await message.reply(f"🔍 Searching: `{query}`")
+    
+    try:
+        audio = get_audio(query)
+        if not audio:
+            return await status.edit("❌ Not found!")
+        
         try:
-            await call.join_group_call(
-                msg.chat.id,
-                AudioPiped(file)
-            )
+            await call.change_stream(message.chat.id, AudioPiped(audio['url']))
         except:
-            await call.change_stream(
-                msg.chat.id,
-                AudioPiped(file)
-            )
+            await call.join_group_call(message.chat.id, AudioPiped(audio['url']))
+        
+        await status.edit(f"▶️ **Playing:** {audio['title']}")
+    except Exception as e:
+        await status.edit(f"❌ {e}")
 
-        await status.edit(f"Playing: {title}")
-    else:
-        await status.edit(f"Queued: {title}")
+@bot.on_message(filters.command("leave"))
+async def leave(client, message):
+    try:
+        await call.leave_group_call(message.chat.id)
+        await message.reply("👋 Left!")
+    except Exception as e:
+        await message.reply(f"❌ {e}")
 
-@app.on_message(filters.command("skip"))
-async def skip(_, msg):
-    if not is_allowed(msg.from_user.id):
-        return
-
-    await play_next(msg.chat.id)
-    await msg.reply("Skipped ⏭️")
-
-@app.on_message(filters.command("stop"))
-async def stop(_, msg):
-    if not is_allowed(msg.from_user.id):
-        return
-
-    queues[msg.chat.id] = deque()
-    await call.leave_group_call(msg.chat.id)
-    await msg.reply("Stopped ❌")
-
-@app.on_message(filters.command("pause"))
-async def pause(_, msg):
-    if not is_allowed(msg.from_user.id):
-        return
-
-    await call.pause_stream(msg.chat.id)
-    await msg.reply("Paused ⏸️")
-
-@app.on_message(filters.command("resume"))
-async def resume(_, msg):
-    if not is_allowed(msg.from_user.id):
-        return
-
-    await call.resume_stream(msg.chat.id)
-    await msg.reply("Resumed ▶️")
-
-# ================= EVENTS =================
-@call.on_stream_end()
-async def stream_end(_, update):
-    chat_id = update.chat_id
-    await play_next(chat_id)
-
-# ================= START =================
-async def main():
-    await app.start()
-    await call.start()
-    print("Userbot Music Started 🔥")
-    await idle()
-
-from pyrogram import idle
-asyncio.run(main())
+# ========== START ==========
+if __name__ == "__main__":
+    # Start Flask in thread
+    Thread(target=run_flask, daemon=True).start()
+    
+    # Start bot
+    print("🚀 Starting bot...")
+    call.run()
+    
