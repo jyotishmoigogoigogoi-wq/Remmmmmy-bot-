@@ -1,6 +1,7 @@
-pyrogram
-pytgcalls
-tgcrypto
-yt-dlp
-flask
-gunicorn
+pyrogram==2.0.106
+tgcalls==2.0.0
+pytgcalls==2.1.0
+tgcrypto==1.2.5
+yt-dlp==2025.1.26
+flask==3.0.3
+gunicorn==22.0.0
